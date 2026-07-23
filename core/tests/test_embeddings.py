@@ -91,10 +91,27 @@ def test_embedding_cache_key_stable_across_processes():
     assert expected_hash in key_a
 
 
+class _FakeOpenAIResponse:
+    """Stands in for httpx.Response so no real network call is made."""
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"data": [{"embedding": [0.1] * 1536}]}
+
+
 @pytest.mark.asyncio
 async def test_generate_embedding_uses_sha256_cache_key(monkeypatch):
     """The cache key written to/read from Redis must be derived from
-    hashlib.sha256, not the process-unstable builtin hash()."""
+    hashlib.sha256, not the process-unstable builtin hash().
+
+    Patches httpx.AsyncClient.post directly (the actual network boundary)
+    rather than the private _openai_embedding helper, since patching that
+    by dotted string path proved unreliable in CI -- httpx.post is a much
+    more standard mocking seam and guarantees no real API call is ever made
+    regardless of that.
+    """
     config = TenantEmbeddingConfig(
         tenant_id="tenant1",
         provider="openai",
@@ -106,14 +123,17 @@ async def test_generate_embedding_uses_sha256_cache_key(monkeypatch):
     redis = AsyncMock()
     redis.get.return_value = None
     monkeypatch.setattr("services.embeddings.get_redis", lambda: redis)
-    monkeypatch.setattr(
-        "services.embeddings._openai_embedding",
-        AsyncMock(return_value=[0.1] * 1536),
-    )
+
+    async def fake_post(self, *args, **kwargs):
+        return _FakeOpenAIResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient.post", fake_post)
 
     await generate_embedding_with_config("hello world", config)
 
     expected_hash = hashlib.sha256("hello world".encode()).hexdigest()
+    redis.get.assert_awaited_once()
+    redis.setex.assert_awaited_once()
     get_key = redis.get.call_args[0][0]
     setex_key = redis.setex.call_args[0][0]
 
